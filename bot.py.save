@@ -1,0 +1,519 @@
+"""
+bot.py - Main Telegram Bot: OTP / Session Store
+Refactored: all DB calls are now async via asyncpg (no more event loop blocking).
+"""
+import os
+import re
+import csv
+import html
+import time
+import asyncio
+import logging
+import zipfile
+import shutil
+from datetime import datetime
+
+import aiohttp
+from telethon import TelegramClient, events, Button
+from telethon.errors import (
+    SessionPasswordNeededError,
+    MessageNotModifiedError,
+    UserNotParticipantError,
+    ChatAdminRequiredError,
+    AuthKeyUnregisteredError,
+    AuthKeyDuplicatedError,
+    UserDeactivatedBanError,
+)
+from telethon.tl.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButtonRow,
+    KeyboardButton,
+    KeyboardButtonWebView,
+)
+from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.tl.functions.account import GetPasswordRequest
+
+# ─── Project Imports ──────────────────────────────────────────────────────────
+from config import (
+    API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
+    LOG_CHANNEL_ID, CHECK_CHANNELS, JOIN_URLS,
+    UPI_ID, UPI_MID,
+    BANK_NAME, BANK_HOLDER, BANK_ACCOUNT_NO, BANK_IFSC,
+    TERMS_URL, AUTO_CANCEL_SECONDS, OTP_REGEX,
+    START_IMAGE, DEPOSIT_IMAGE, PROFILE_IMAGE, STATS_IMAGE, SUPPORT_IMAGE, BUY_IMAGE,
+    P_YES, P_NO, P_PKG, P_MONEY, P_USDT, P_INR, P_TG,
+    P_GIFT, P_STATS, P_CARD, P_USERS, P_CAL, P_PC, P_EYE,
+    P_UPI, P_CW, P_ON, P_OFF, P_ID, P_KEY, P_GLOBE,
+    P_CART, P_STORE, P_OTP, P_2FA, P_FLAG, P_PHONE,
+    P_WAIT, P_TIME, P_WARN, P_DOC, P_SOS, P_ASST, P_ACC,
+)
+from database import (
+    get_pool, get_user_lock, init_db_pool, setup_db, keepalive_loop,
+    ensure_user, is_user_banned, update_balance,
+    is_bot_online, get_usdt_rate, get_support_url, to_usd, get_maint_msg,
+    is_referral_enabled, is_images_enabled, get_stock_layout,
+    get_welcome_msg, is_autopay_enabled, get_autopay_config,
+)
+from helpers import (
+    is_admin, has_perm,
+    check_channel_joined,
+    COUNTRY_CODES,
+    get_flag_by_country_name, get_country_info,
+    delete_session_files,
+)
+from addstock_devices import run_addstock_flow, register_device_handlers, bot_session_pending_logout
+from demo import register_demo_handlers
+from email_verify import fetch_recent_credits
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ─── Bot Client ───────────────────────────────────────────────────────────────
+os.makedirs("sessions", exist_ok=True)
+session_name = f"sessions/bot_{BOT_TOKEN.split(':')[0]}"
+bot = TelegramClient(session_name, API_ID, API_HASH)
+bot.parse_mode = 'html'
+
+# ─── Shared HTTP Session ──────────────────────────────────────────────────────
+_http_session: aiohttp.ClientSession = None
+
+def get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15),
+            connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300),
+        )
+    return _http_session
+
+# ─── In-Memory State ─────────────────────────────────────────────────────────
+active_orders:      dict = {}
+waiting_proof:      dict = {}
+deposit_input:      dict = {}
+admin_dep_state:    dict = {}
+user_spam_cooldown: dict = {}
+session_buy_state:  dict = {}
+custom_dep_amt:     dict = {}
+autopay_input:      dict = {}
+autopay_state:      dict = {}
+add_session_file_state: dict = {}
+
+# ─── Image cache (avoids re-fetching banner images on every message) ──────────
+_image_cache: dict = {}
+
+# ─── Bot-me cache (avoids calling bot.get_me() on every request) ─────────────
+_bot_me = None
+
+async def get_bot_me():
+    global _bot_me
+    if _bot_me is None:
+        _bot_me = await bot.get_me()
+    return _bot_me
+
+# ─── Entity cache (avoids calling bot.get_entity() on every menu load) ────────
+_entity_cache: dict = {}  # uid -> (entity, timestamp)
+_ENTITY_TTL = 300  # seconds
+
+async def get_cached_entity(uid: int):
+    import time
+    now = time.time()
+    if uid in _entity_cache:
+        entity, ts = _entity_cache[uid]
+        if now - ts < _ENTITY_TTL:
+            return entity
+    try:
+        entity = await bot.get_entity(uid)
+        _entity_cache[uid] = (entity, now)
+        return entity
+    except Exception:
+        return None
+
+async def get_cached_image(url: str):
+    """Upload image once to Telegram and reuse the file_id thereafter.
+    Works for both remote URLs and local file paths on the VPS."""
+    if url not in _image_cache:
+        try:
+            msg = await bot.send_file("me", url)
+            _image_cache[url] = msg.media
+        except Exception:
+            _image_cache[url] = None
+    return _image_cache[url]
+
+
+async def get_banner_image(key: str, default_url: str) -> str:
+    """Return the active banner image for `key`: a custom VPS-uploaded image
+    if the admin set one via the Banner Images panel, else the default URL
+    from config.py. Stored in the `settings` table so it's shared across
+    multiple bot instances using the same database."""
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", f"banner_{key}")
+        if row and row["value"] and os.path.exists(row["value"]):
+            return row["value"]
+    except Exception as exc:
+        logger.warning(f"get_banner_image lookup failed for {key}: {exc}")
+    return default_url
+
+
+# =============================================================================
+#  LOG CHANNEL HELPERS
+# =============================================================================
+def _get_purchase_log_channel() -> int:
+    try:
+        from config import PURCHASE_LOG_CHANNEL_ID
+        return int(PURCHASE_LOG_CHANNEL_ID)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return LOG_CHANNEL_ID
+
+def _get_payment_log_channel() -> int:
+    try:
+        from config import PAYMENT_LOG_CHANNEL_ID
+        return int(PAYMENT_LOG_CHANNEL_ID)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return LOG_CHANNEL_ID
+
+
+# =============================================================================
+#  IMAGE HELPER
+# =============================================================================
+async def send_with_image(chat_id: int, image: str, caption: str, buttons=None):
+    if image and await is_images_enabled():
+        try:
+            media = await get_cached_image(image)
+            if media:
+                return await bot.send_file(chat_id, media, caption=caption, buttons=buttons)
+            return await bot.send_file(chat_id, image, caption=caption, buttons=buttons)
+        except Exception as exc:
+            logger.warning(f"send_with_image failed ({exc}), falling back to text.")
+    return await bot.send_message(chat_id, caption, buttons=buttons)
+
+
+async def get_persistent_menu(uid: int) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton("🛒 Buy Account"), KeyboardButton("👤 My Profile")],
+        [KeyboardButton("📁 Buy Sessions")],
+        [KeyboardButton("💰 Deposit"), KeyboardButton("📊 My Stats")],
+        [KeyboardButton("📞 Support")],
+    ]
+    if await is_admin(uid):
+        rows.append([KeyboardButton("🔐 Admin Panel")])
+    return ReplyKeyboardMarkup([KeyboardButtonRow(r) for r in rows], resize=True)
+
+
+async def send_main_menu(event, uid: int):
+    if not await is_bot_online() and not await is_admin(uid):
+        maint_text = await get_maint_msg()
+        msg = f"{P_OFF} <b>Maintenance Mode</b>\n\n{maint_text}"
+        if isinstance(event, events.CallbackQuery.Event):
+            try:
+                await event.edit(msg)
+            except Exception:
+                await bot.send_message(uid, msg)
+        else:
+            await bot.send_message(uid, msg)
+        return
+
+    try:
+        sender = await get_cached_entity(uid)
+        first_name = (sender.first_name if sender else None) or "there"
+    except Exception:
+        first_name = "there"
+
+    msg = await get_welcome_msg(first_name)
+    inline_btns = None
+
+    if isinstance(event, events.CallbackQuery.Event):
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        _start_img = await get_banner_image("start", START_IMAGE)
+        await send_with_image(uid, _start_img, msg, buttons=inline_btns)
+        await bot.send_message(uid, ".", buttons=await get_persistent_menu(uid))
+    else:
+        _start_img = await get_banner_image("start", START_IMAGE)
+        await send_with_image(uid, _start_img, msg, buttons=inline_btns)
+        await bot.send_message(uid, ".", buttons=await get_persistent_menu(uid))
+
+
+def format_payment_buttons(buttons: list) -> list:
+    res = []
+    for i in range(0, len(buttons), 2):
+        res.append(buttons[i:i + 2])
+    return res
+
+
+def get_keypad() -> list:
+    return [
+        [Button.inline("1", "kp_1"), Button.inline("2", "kp_2"), Button.inline("3", "kp_3")],
+        [Button.inline("4", "kp_4"), Button.inline("5", "kp_5"), Button.inline("6", "kp_6")],
+        [Button.inline("7", "kp_7"), Button.inline("8", "kp_8"), Button.inline("9", "kp_9")],
+        [Button.inline("🔙 Del", "kp_del"), Button.inline("0", "kp_0"), Button.inline("✅ Confirm", "kp_done")],
+        [Button.inline("❌ Cancel", "cancel_action")],
+    ]
+
+
+def get_bank_keypad() -> list:
+    return [
+        [Button.inline("1", "bkp_1"), Button.inline("2", "bkp_2"), Button.inline("3", "bkp_3")],
+        [Button.inline("4", "bkp_4"), Button.inline("5", "bkp_5"), Button.inline("6", "bkp_6")],
+        [Button.inline("7", "bkp_7"), Button.inline("8", "bkp_8"), Button.inline("9", "bkp_9")],
+        [Button.inline("🔙 Del", "bkp_del"), Button.inline("0", "bkp_0"), Button.inline("✅ Confirm", "bkp_done")],
+        [Button.inline("❌ Cancel", "cancel_action")],
+    ]
+
+
+def get_autopay_keypad() -> list:
+    return [
+        [Button.inline("1", "akp_1"), Button.inline("2", "akp_2"), Button.inline("3", "akp_3")],
+        [Button.inline("4", "akp_4"), Button.inline("5", "akp_5"), Button.inline("6", "akp_6")],
+        [Button.inline("7", "akp_7"), Button.inline("8", "akp_8"), Button.inline("9", "akp_9")],
+        [Button.inline("🔙 Del", "akp_del"), Button.inline("0", "akp_0"), Button.inline("✅ Confirm", "akp_done")],
+        [Button.inline("❌ Cancel", "cancel_action")],
+    ]
+
+
+def get_admin_custom_keypad(dep_id: int) -> list:
+    d = dep_id
+    return [
+        [Button.inline("1", f"dkp|{d}|1"), Button.inline("2", f"dkp|{d}|2"), Button.inline("3", f"dkp|{d}|3")],
+        [Button.inline("4", f"dkp|{d}|4"), Button.inline("5", f"dkp|{d}|5"), Button.inline("6", f"dkp|{d}|6")],
+        [Button.inline("7", f"dkp|{d}|7"), Button.inline("8", f"dkp|{d}|8"), Button.inline("9", f"dkp|{d}|9")],
+        [Button.inline("🔙 Del", f"dkp|{d}|del"), Button.inline("0", f"dkp|{d}|0"), Button.inline("✅ Confirm", f"dkp|{d}|conf")],
+        [Button.inline("❌ Cancel", f"dkp|{d}|cancel")],
+    ]
+
+
+# =============================================================================
+#  LOGGING / NOTIFICATIONS
+# =============================================================================
+async def process_referral_bonus(uid: int, amount: int):
+    if not await is_referral_enabled():
+        return
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT referred_by FROM users WHERE user_id=$1", uid)
+    ref = row["referred_by"] if row else None
+    if not ref:
+        return
+    async with pool.acquire() as conn:
+        pct_row = await conn.fetchrow("SELECT value FROM settings WHERE key='ref_percent'")
+    pct = float(pct_row["value"]) if pct_row else 3.0
+    if pct > 0:
+        bonus = int(amount * (pct / 100))
+        if bonus > 0:
+            await update_balance(ref, bonus)
+            try:
+                await bot.send_message(
+                    ref,
+                    f"{P_GIFT} <b>Referral Bonus!</b>\nYour referral <code>{uid}</code> deposited {P_INR}{amount}.\n"
+                    f"{P_YES} You earned <b>{P_INR}{bonus}</b>!",
+                )
+            except Exception:
+                pass
+
+
+async def log_primary_deposit(uid: int, amt: int, method: str):
+    try:
+        try:
+            user = await get_cached_entity(int(uid))
+            username = html.escape(user.username) if user and user.username else "NoUsername"
+        except Exception:
+            username = "NoUsername"
+        t = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        msg = (
+            f"{P_YES} <b>NEW DEPOSIT SUCCESSFUL</b>\n\n"
+            f"{P_ACC} User ID: <code>{uid}</code>\n"
+            f"👤 Username: @{username}\n"
+            f"{P_MONEY} Amount: {P_INR}{amt}\n"
+            f"{P_CARD} Method: {method}\n"
+            f"{P_TIME} Time: {t}\n\n"
+            f"<i>Thanks for depositing in Fresh Tg!</i>"
+        )
+        await bot.send_message(_get_payment_log_channel(), msg)
+    except Exception as exc:
+        logger.error(f"log_primary_deposit error: {exc}")
+
+
+async def log_primary_purchase(uid: int, country: str, price: int, amount: int, year: int, qty: int, phone: str = None, otp: str = None, twofa: str = None):
+    try:
+        t = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        me = await get_bot_me()
+        bot_username = f"@{me.username}" if me and me.username else ""
+
+        # Hide middle digits of phone: +91XXXXX1234 → show first 5 and last 3
+        def mask_phone(p):
+            if not p:
+                return "N/A"
+            p = str(p).strip()
+            if len(p) <= 8:
+                return p
+            return p[:5] + "•" * (len(p) - 8) + p[-3:]
+
+        # Hide OTP: show first 1 and last 1 digit, mask middle
+        def mask_otp(o):
+            if not o:
+                return "N/A"
+            o = str(o).strip()
+            if len(o) <= 2:
+                return "*" * len(o)
+            return o[0] + "*" * (len(o) - 2) + o[-1]
+
+        phone_display = mask_phone(phone)
+        otp_display = mask_otp(otp)
+        twofa_display = twofa if twofa and twofa != "None" else "Disabled"
+
+        msg = (
+            f"<b>🛍️ New Number Purchased</b>\n\n"
+            f"<blockquote>"
+            f"🌍 <b>Country :</b> {country}\n"
+            f"📅 <b>Year :</b> {year}\n"
+            f"📦 <b>Qty :</b> {qty}"
+            f"</blockquote>\n\n"
+            f"<blockquote>"
+            f"📱 <b>Number :</b> <code>{phone_display}</code>\n"
+            f"🔑 <b>OTP :</b> <code>{otp_display}</code>\n"
+            f"🔒 <b>2FA :</b> <code>{twofa_display}</code>"
+            f"</blockquote>\n\n"
+            f"<blockquote>"
+            f"💰 <b>Price :</b> {P_INR}{price}\n"
+            f"🕐 <b>Time :</b> {t}"
+            f"</blockquote>\n\n"
+            f"🆔 <b>User ID :</b> <code>{uid}</code>\n\n"
+            f"✦ {bot_username} ✦"
+        )
+        await bot.send_message(_get_purchase_log_channel(), msg)
+    except Exception as exc:
+        logger.error(f"log_primary_purchase error: {exc}")
+
+
+# =============================================================================
+#  DEPOSIT HANDLERS
+# =============================================================================
+async def deposit_menu(event, edit: bool = False):
+    msg = (
+        f"{P_CARD} <b>Select Payment Method:</b>\n\n"
+        f"{P_ON} Choose Automatic for instant credit.\n"
+        f"{P_WAIT} Choose Manual for other methods."
+    )
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        customs = await conn.fetch("SELECT name FROM custom_payments")
+    flat_buttons = [Button.inline(f"💳 {r['name']}", f"depm_{r['name']}") for r in customs]
+    top_btns = []
+    if await is_autopay_enabled():
+        top_btns.append([Button.inline("🤖 Auto Payment (Instant)", "dep_autopay")])
+    btns = top_btns + format_payment_buttons(flat_buttons)
+    if edit and isinstance(event, events.CallbackQuery.Event):
+        try:
+            await event.edit(msg, buttons=btns)
+            return
+        except Exception:
+            pass
+    _deposit_img = await get_banner_image("deposit", DEPOSIT_IMAGE)
+    await send_with_image(event.chat_id, _deposit_img, msg, buttons=btns)
+
+
+async def manual_deposit_init(event, method: str):
+    uid = event.sender_id
+    deposit_input[uid] = {'step': 'wait_amt', 'method': method}
+    await event.edit(
+        f"{P_CARD} <b>{method} Deposit</b>\n\n"
+        f"👇 Reply to this message with the <b>AMOUNT</b> in ₹ (INR) you want to deposit.",
+        buttons=[[Button.inline("❌ Cancel", "cancel_action")]],
+    )
+
+
+async def init_upi_keypad(event):
+    uid = event.sender_id
+    deposit_input[uid] = {'step': 'upi_keypad', 'val': '0'}
+    await event.edit(
+        f"{P_KEY} <b>ENTER AMOUNT IN INR (Min ₹1)</b>\n\n{P_MONEY} <code>₹0</code>",
+        buttons=get_keypad(),
+    )
+
+
+async def keypad_logic(event):
+    uid = event.sender_id
+    action = event.data.decode().replace("kp_", "")
+    curr = deposit_input.get(uid, {}).get('val', "0")
+    if action.isdigit():
+        curr = action if curr == "0" else curr + action
+        if len(curr) > 5:
+            curr = curr[:5]
+    elif action == "del":
+        curr = curr[:-1] or "0"
+    elif action == "done":
+        amt = int(curr)
+        if amt < 1:
+            return await event.answer("⚠️ Minimum Deposit is ₹1", alert=True)
+        return await show_upi_qr(event, amt)
+    deposit_input[uid] = {'step': 'upi_keypad', 'val': curr}
+    try:
+        await event.edit(
+            f"{P_KEY} <b>ENTER AMOUNT IN INR</b>\n\n{P_MONEY} <code>₹{curr}</code>",
+            buttons=get_keypad(),
+        )
+    except MessageNotModifiedError:
+        pass
+
+
+async def show_upi_qr(event, amount: int):
+    uid = event.sender_id
+    order_id = f"ORDER_{uid}_{int(time.time())}"
+    await event.edit(f"{P_WAIT} Generating Payment QR...")
+    url = f"https://redoxng.in/api/genqr.php?upi={UPI_ID}&amount={amount}&name=Pay&orderId={order_id}"
+    try:
+        session = get_http_session()
+        async with session.get(url) as resp:
+            data = await resp.json(content_type=None)
+        if not data.get("success"):
+            return await event.edit(f"{P_NO} Failed to generate QR. Please try again.")
+        qr_url = data['url']
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO upi_orders (order_id, user_id, amount, status) VALUES ($1,$2,$3,$4)",
+                order_id, uid, amount, "pending",
+            )
+        msg = (
+            f"{P_UPI} <b>AUTOMATIC UPI PAYMENT</b>\n\n"
+            f"{P_MONEY} Amount: <code>₹{amount}</code>\n"
+            f"{P_ID} Order ID: <code>{order_id}</code>\n\n"
+            f"👇 Scan the QR below.\nClick <b>✅ Check Payment</b> after paying."
+        )
+        await event.delete()
+        sent_msg = await bot.send_file(
+            uid, qr_url, caption=msg,
+            buttons=[
+                [Button.inline("✅ Check Payment", f"check_upi_{order_id}")],
+                [Button.inline("❌ Cancel", "cancel_action")],
+            ],
+        )
+        asyncio.create_task(auto_check_upi_task(uid, order_id, sent_msg))
+    except Exception as exc:
+        logger.error(f"show_upi_qr error: {exc}")
+        await bot.send_message(uid, f"{P_NO} Error generating QR: {exc}")
+
+
+async def auto_check_upi_task(uid: int, order_id: str, msg_to_edit):
+    pool = get_pool()
+    for _ in range(60):
+        await asyncio.sleep(10)
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT amount, status FROM upi_orders WHERE order_id=$1", order_id
+            )
+        if not row or row["status"] != 'pending':
+            break
+        url = f"https://redoxng.in/api/verify.php?orderId={order_id}&mid={UPI_MID}"
+        try:
+            session = get_http_session()
+            async with session.get(url) as resp:
+                data = await resp.json(content_type=None)
+ 

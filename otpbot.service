@@ -1,0 +1,15 @@
+[Unit]
+Description=OTP Telegram Bot
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/root/otpbot
+ExecStart=/usr/bin/python3 /root/otpbot/bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
